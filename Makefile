@@ -42,6 +42,9 @@ CFLAGS   = -I.              -O3 -DNDEBUG -std=c11   -fPIC
 CXXFLAGS = -I. -I./examples -O3 -DNDEBUG -std=c++11 -fPIC
 LDFLAGS  =
 
+# sqlite
+LDFLAGS += -lsqlite3
+
 ifdef MACOSX_DEPLOYMENT_TARGET
 	CFLAGS   += -mmacosx-version-min=$(MACOSX_DEPLOYMENT_TARGET)
 	CXXFLAGS += -mmacosx-version-min=$(MACOSX_DEPLOYMENT_TARGET)

@@ -677,6 +677,7 @@ bool read_wav(const std::string & fname, std::vector<float>& pcmf32, std::vector
 
     if (wav.sampleRate != COMMON_SAMPLE_RATE) {
         fprintf(stderr, "%s: WAV file '%s' must be %i kHz\n", __func__, fname.c_str(), COMMON_SAMPLE_RATE/1000);
+        fprintf(stderr, "%s: WAV file '%s' has sample rate %i kHz\n", __func__, fname.c_str(), wav.sampleRate/1000);
         return false;
     }
 

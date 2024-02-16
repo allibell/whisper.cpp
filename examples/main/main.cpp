@@ -83,6 +83,7 @@ struct whisper_params {
     bool output_srt      = false;
     bool output_wts      = false;
     bool output_csv      = false;
+    bool output_sqlite   = false;
     bool output_jsn      = false;
     bool output_jsn_full = false;
     bool output_lrc      = false;
@@ -155,6 +156,7 @@ bool whisper_params_parse(int argc, char ** argv, whisper_params & params) {
         else if (arg == "-olrc" || arg == "--output-lrc")      { params.output_lrc      = true; }
         else if (arg == "-fp"   || arg == "--font-path")       { params.font_path       = argv[++i]; }
         else if (arg == "-ocsv" || arg == "--output-csv")      { params.output_csv      = true; }
+        else if (arg == "-osql" || arg == "--outout-sql")      { params.output_sqlite   = true; }
         else if (arg == "-oj"   || arg == "--output-json")     { params.output_jsn      = true; }
         else if (arg == "-ojf"  || arg == "--output-json-full"){ params.output_jsn_full = params.output_jsn = true; }
         else if (arg == "-of"   || arg == "--output-file")     { params.fname_out.emplace_back(argv[++i]); }
@@ -263,7 +265,7 @@ std::string estimate_diarization_speaker(std::vector<std::vector<float>> pcmf32s
         speaker = "?";
     }
 
-    //printf("is0 = %lld, is1 = %lld, energy0 = %f, energy1 = %f, speaker = %s\n", is0, is1, energy0, energy1, speaker.c_str());
+    // printf("is0 = %lld, is1 = %lld, energy0 = %f, energy1 = %f, speaker = %s\n", is0, is1, energy0, energy1, speaker.c_str());
 
     if (!id_only) {
         speaker.insert(0, "(speaker ");
@@ -438,35 +440,26 @@ bool output_srt(struct whisper_context * ctx, const char * fname, const whisper_
     return true;
 }
 
-char *escape_double_quotes_and_backslashes(const char *str) {
-    if (str == NULL) {
-        return NULL;
+char * escape_quotes_and_backslashes(const char *str) {
+    std::string s(str);
+    std::string::size_type n = 0;
+    while (( n = s.find( "\"", n ) ) != std::string::npos ) {
+        s.replace( n, 1, "\\\"" );
+        n += 2;
     }
-
-    size_t escaped_length = strlen(str) + 1;
-
-    for (size_t i = 0; str[i] != '\0'; i++) {
-        if (str[i] == '"' || str[i] == '\\') {
-            escaped_length++;
-        }
+    n = 0;
+    while (( n = s.find( "\\", n ) ) != std::string::npos ) {
+        s.replace( n, 1, "\\\\" );
+        n += 2;
     }
-
-    char *escaped = (char *)calloc(escaped_length, 1); // pre-zeroed
-    if (escaped == NULL) {
-        return NULL;
+    n = 0;
+    while (( n = s.find( "'", n ) ) != std::string::npos ) {
+        s.replace( n, 1, "''" );
+        n += 2;
     }
-
-    size_t pos = 0;
-    for (size_t i = 0; str[i] != '\0'; i++) {
-        if (str[i] == '"' || str[i] == '\\') {
-            escaped[pos++] = '\\';
-        }
-        escaped[pos++] = str[i];
-    }
-
-    // no need to set zero due to calloc() being used prior
-
-    return escaped;
+    char *cstr = new char[s.length() + 1];
+    strcpy(cstr, s.c_str());
+    return cstr;
 }
 
 bool output_csv(struct whisper_context * ctx, const char * fname, const whisper_params & params, std::vector<std::vector<float>> pcmf32s) {
@@ -490,7 +483,7 @@ bool output_csv(struct whisper_context * ctx, const char * fname, const whisper_
         const char * text = whisper_full_get_segment_text(ctx, i);
         const int64_t t0 = whisper_full_get_segment_t0(ctx, i);
         const int64_t t1 = whisper_full_get_segment_t1(ctx, i);
-        char * text_escaped = escape_double_quotes_and_backslashes(text);
+        char * text_escaped = escape_quotes_and_backslashes(text);
 
         //need to multiply times returned from whisper_full_get_segment_t{0,1}() by 10 to get milliseconds.
         fout << 10 * t0 << "," << 10 * t1 << ",";
@@ -501,6 +494,70 @@ bool output_csv(struct whisper_context * ctx, const char * fname, const whisper_
         fout << "\"" << text_escaped << "\"\n";
     }
 
+    return true;
+}
+
+#include <sqlite3.h>
+
+bool output_sqlite(struct whisper_context * ctx, const char * dbname, const whisper_params & params, std::vector<std::vector<float>> pcmf32s) {
+    sqlite3 *db;
+    char *zErrMsg = 0;
+    int rc;
+
+    rc = sqlite3_open(dbname, &db);
+
+    if (rc) {
+        fprintf(stderr, "Can't open database: %s\n", sqlite3_errmsg(db));
+        return false;
+    }
+
+    const char *sql = "CREATE TABLE IF NOT EXISTS Segments("
+            "Start INT,"
+            "End INT,"
+            "Speaker TEXT,"
+            "Text TEXT,"
+            "SummaryId TEXT,"
+            "SpeakerTargetId TEXT);";
+
+    rc = sqlite3_exec(db, sql, NULL, 0, &zErrMsg);
+
+    if (rc != SQLITE_OK) {
+        fprintf(stderr, "SQL error: %s\n", zErrMsg);
+        sqlite3_free(zErrMsg);
+    }
+
+    const int n_segments = whisper_full_n_segments(ctx);
+
+    for (int i = 0; i < n_segments; ++i) {
+        const char * text = whisper_full_get_segment_text(ctx, i);
+        const int64_t t0 = whisper_full_get_segment_t0(ctx, i);
+        const int64_t t1 = whisper_full_get_segment_t1(ctx, i);
+        char * text_escaped = escape_quotes_and_backslashes(text);
+
+        std::string speaker = "";
+        if (params.diarize && pcmf32s.size() == 2)
+        {
+            speaker = estimate_diarization_speaker(pcmf32s, t0, t1, true);
+        }
+
+    std::string sql_insert = "INSERT INTO Segments (Start, End, Speaker, Text, SummaryId, SpeakerTargetId) VALUES (" +
+                            std::to_string(10 * t0) + "," +
+                            std::to_string(10 * t1) + ",'" +
+                            speaker + "','" +
+                            text_escaped + "'," +
+                            "NULL," + // empty til overwritten by Summarizer
+                            "NULL" + // empty til overwritten by SpeakerTargeter
+                            ");";
+
+        rc = sqlite3_exec(db, sql_insert.c_str(), NULL, 0, &zErrMsg);
+
+        if (rc != SQLITE_OK) {
+            fprintf(stderr, "SQL error: %s\n", zErrMsg);
+            sqlite3_free(zErrMsg);
+        }
+    }
+
+    sqlite3_close(db);
     return true;
 }
 
@@ -571,7 +628,7 @@ bool output_json(
 
     auto value_s = [&](const char *name, const char *val, bool end) {
         start_value(name);
-        char * val_escaped = escape_double_quotes_and_backslashes(val);
+        char * val_escaped = escape_quotes_and_backslashes(val);
         fout << "\"" << val_escaped << (end ? "\"\n" : "\",\n");
         free(val_escaped);
     };
@@ -1064,6 +1121,16 @@ int main(int argc, char ** argv) {
             if (params.output_csv) {
                 const auto fname_csv = fname_out + ".csv";
                 output_csv(ctx, fname_csv.c_str(), params, pcmf32s);
+            }
+
+            if (params.output_sqlite) {
+                std::string fname_out_no_suffix = fname_out;
+                std::size_t pos = fname_out_no_suffix.find_last_of(".");
+                if (pos != std::string::npos && fname_out_no_suffix.substr(pos) == ".wav") {
+                    fname_out_no_suffix = fname_out_no_suffix.substr(0, pos);
+                }
+                const auto fname_sqlite = fname_out_no_suffix + ".sqlite";
+                output_sqlite(ctx, fname_sqlite.c_str(), params, pcmf32s);
             }
 
             // output to JSON file

@@ -12,6 +12,7 @@
 #include <thread>
 #include <vector>
 #include <fstream>
+#include <sqlite3.h>
 
 
 //  500 -> 00:05.000
@@ -27,6 +28,7 @@ std::string to_timestamp(int64_t t) {
 
     return std::string(buf);
 }
+
 
 // command-line parameters
 struct whisper_params {
@@ -54,6 +56,7 @@ struct whisper_params {
     std::string language  = "en";
     std::string model     = "models/ggml-base.en.bin";
     std::string fname_out;
+    bool output_sqlite = false;
 };
 
 void whisper_print_usage(int argc, char ** argv, const whisper_params & params);
@@ -86,6 +89,7 @@ bool whisper_params_parse(int argc, char ** argv, whisper_params & params) {
         else if (arg == "-tdrz" || arg == "--tinydiarize")   { params.tinydiarize   = true; }
         else if (arg == "-sa"   || arg == "--save-audio")    { params.save_audio    = true; }
         else if (arg == "-ng"   || arg == "--no-gpu")        { params.use_gpu       = false; }
+        else if (arg == "-osql" || arg == "--output-sql")    { params.output_sqlite = true;  } 
 
         else {
             fprintf(stderr, "error: unknown argument: %s\n", arg.c_str());
@@ -120,10 +124,102 @@ void whisper_print_usage(int /*argc*/, char ** argv, const whisper_params & para
     fprintf(stderr, "  -l LANG,  --language LANG [%-7s] spoken language\n",                                params.language.c_str());
     fprintf(stderr, "  -m FNAME, --model FNAME   [%-7s] model path\n",                                     params.model.c_str());
     fprintf(stderr, "  -f FNAME, --file FNAME    [%-7s] text output file name\n",                          params.fname_out.c_str());
+    fprintf(stderr, "  -osql,    --output_sql    [%-7s] output SQL format\n",                              params.output_sqlite ? "true" : "false");
     fprintf(stderr, "  -tdrz,    --tinydiarize   [%-7s] enable tinydiarize (requires a tdrz model)\n",     params.tinydiarize ? "true" : "false");
     fprintf(stderr, "  -sa,      --save-audio    [%-7s] save the recorded audio to a file\n",              params.save_audio ? "true" : "false");
     fprintf(stderr, "  -ng,      --no-gpu        [%-7s] disable GPU inference\n",                          params.use_gpu ? "false" : "true");
     fprintf(stderr, "\n");
+}
+
+char * escape_quotes_and_backslashes(const char *str) {
+    std::string s(str);
+    std::string::size_type n = 0;
+    while (( n = s.find( "\"", n ) ) != std::string::npos ) {
+        s.replace( n, 1, "\\\"" );
+        n += 2;
+    }
+    n = 0;
+    while (( n = s.find( "\\", n ) ) != std::string::npos ) {
+        s.replace( n, 1, "\\\\" );
+        n += 2;
+    }
+    n = 0;
+    while (( n = s.find( "'", n ) ) != std::string::npos ) {
+        s.replace( n, 1, "''" );
+        n += 2;
+    }
+    char *cstr = new char[s.length() + 1];
+    strcpy(cstr, s.c_str());
+    return cstr;
+}
+
+bool init_sqlite(const char * dbname) {
+    sqlite3 *db;
+    char *zErrMsg = 0;
+    int rc;
+
+    rc = sqlite3_open(dbname, &db);
+
+    if (rc) {
+        fprintf(stderr, "Can't open database: %s\n", sqlite3_errmsg(db));
+        return false;
+    }
+
+    const char *sql = "CREATE TABLE IF NOT EXISTS Segments("
+            "Start INT,"
+            "End INT,"
+            "Speaker TEXT,"
+            "Text TEXT,"
+            "SummaryId TEXT,"
+            "SpeakerTargetId TEXT);";
+
+    rc = sqlite3_exec(db, sql, NULL, 0, &zErrMsg);
+
+    if (rc != SQLITE_OK) {
+        fprintf(stderr, "SQL error: %s\n", zErrMsg);
+        sqlite3_free(zErrMsg);
+    }
+    return true;
+}
+
+bool output_sqlite(struct whisper_context * ctx, const char * dbname, int64_t t0, int64_t t1, const whisper_params & params) {
+    sqlite3 *db;
+    char *zErrMsg = 0;
+    int rc;
+
+    rc = sqlite3_open(dbname, &db);
+
+    const int n_segments = whisper_full_n_segments(ctx);
+
+    std::string all_segments;
+
+    for (int i = 0; i < n_segments; ++i) {
+        const char * text = whisper_full_get_segment_text(ctx, i);
+        char * text_escaped = escape_quotes_and_backslashes(text);
+        all_segments += text_escaped;
+        if (i < n_segments - 1) {
+            all_segments += "\n";
+        }
+    }
+
+    std::string sql_insert = "INSERT INTO Segments (Start, End, Speaker, Text, SummaryId, SpeakerTargetId) VALUES (" +
+                            std::to_string(10 * t0) + "," +
+                            std::to_string(10 * t1) + "," +
+                            "NULL," + // Speaker empty til overwritten by SpeakerTargeter
+                            "'" + all_segments + "'," +
+                            "NULL," + // SummaryId empty til overwritten by Summarizer
+                            "NULL" + // SpeakerTargetID empty til overwritten by SpeakerTargeter
+                            ");";
+
+    rc = sqlite3_exec(db, sql_insert.c_str(), NULL, 0, &zErrMsg);
+
+    if (rc != SQLITE_OK) {
+        fprintf(stderr, "SQL error: %s\n", zErrMsg);
+        sqlite3_free(zErrMsg);
+    }
+
+    sqlite3_close(db);
+    return true;
 }
 
 int main(int argc, char ** argv) {
@@ -219,6 +315,9 @@ int main(int argc, char ** argv) {
             return 1;
         }
     }
+    if (params.output_sqlite) {
+        init_sqlite( "output.sqlite");
+    }
 
     wav_writer wavWriter;
     // save wav file
@@ -236,12 +335,11 @@ int main(int argc, char ** argv) {
 
     auto t_last  = std::chrono::high_resolution_clock::now();
     const auto t_start = t_last;
+    std::vector<float> pcmf32_all;
 
     // main audio loop
     while (is_running) {
-        if (params.save_audio) {
-            wavWriter.write(pcmf32_new.data(), pcmf32_new.size());
-        }
+        
         // handle Ctrl + C
         is_running = sdl_poll_events();
 
@@ -252,6 +350,9 @@ int main(int argc, char ** argv) {
         // process new audio
 
         if (!use_vad) {
+            if (params.save_audio) {
+                wavWriter.write(pcmf32_new.data(), pcmf32_new.size());
+            }
             while (true) {
                 audio.get(params.step_ms, pcmf32_new);
 
@@ -299,6 +400,9 @@ int main(int argc, char ** argv) {
 
             if (::vad_simple(pcmf32_new, WHISPER_SAMPLE_RATE, 1000, params.vad_thold, params.freq_thold, false)) {
                 audio.get(params.length_ms, pcmf32);
+
+                // Append the new audio data to pcmf32_all
+                pcmf32_all.insert(pcmf32_all.end(), pcmf32.begin(), pcmf32.end());
             } else {
                 std::this_thread::sleep_for(std::chrono::milliseconds(100));
 
@@ -341,6 +445,10 @@ int main(int argc, char ** argv) {
 
             // print result;
             {
+
+                const int64_t t1 = (t_last - t_start).count()/1000000;
+                const int64_t t0 = std::max(0.0, t1 - pcmf32.size()*1000.0/WHISPER_SAMPLE_RATE);
+
                 if (!use_vad) {
                     printf("\33[2K\r");
 
@@ -349,9 +457,6 @@ int main(int argc, char ** argv) {
 
                     printf("\33[2K\r");
                 } else {
-                    const int64_t t1 = (t_last - t_start).count()/1000000;
-                    const int64_t t0 = std::max(0.0, t1 - pcmf32.size()*1000.0/WHISPER_SAMPLE_RATE);
-
                     printf("\n");
                     printf("### Transcription %d START | t0 = %d ms | t1 = %d ms\n", n_iter, (int) t0, (int) t1);
                     printf("\n");
@@ -369,8 +474,8 @@ int main(int argc, char ** argv) {
                             fout << text;
                         }
                     } else {
-                        const int64_t t0 = whisper_full_get_segment_t0(ctx, i);
-                        const int64_t t1 = whisper_full_get_segment_t1(ctx, i);
+                        // const int64_t t0 = whisper_full_get_segment_t0(ctx, i);
+                        // const int64_t t1 = whisper_full_get_segment_t1(ctx, i);
 
                         std::string output = "[" + to_timestamp(t0) + " --> " + to_timestamp(t1) + "]  " + text;
 
@@ -391,6 +496,10 @@ int main(int argc, char ** argv) {
 
                 if (params.fname_out.length() > 0) {
                     fout << std::endl;
+                }
+
+                if (params.output_sqlite) {
+                    output_sqlite(ctx, "output.sqlite", t0, t1, params);
                 }
 
                 if (use_vad) {
@@ -422,6 +531,10 @@ int main(int argc, char ** argv) {
             }
             fflush(stdout);
         }
+    }
+
+    if (params.save_audio && use_vad) {
+        wavWriter.write(pcmf32_all.data(), pcmf32_all.size());
     }
 
     audio.pause();

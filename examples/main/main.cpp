@@ -156,7 +156,7 @@ bool whisper_params_parse(int argc, char ** argv, whisper_params & params) {
         else if (arg == "-olrc" || arg == "--output-lrc")      { params.output_lrc      = true; }
         else if (arg == "-fp"   || arg == "--font-path")       { params.font_path       = argv[++i]; }
         else if (arg == "-ocsv" || arg == "--output-csv")      { params.output_csv      = true; }
-        else if (arg == "-osql" || arg == "--outout-sql")      { params.output_sqlite   = true; }
+        else if (arg == "-osql" || arg == "--output-sql")      { params.output_sqlite   = true; }
         else if (arg == "-oj"   || arg == "--output-json")     { params.output_jsn      = true; }
         else if (arg == "-ojf"  || arg == "--output-json-full"){ params.output_jsn_full = params.output_jsn = true; }
         else if (arg == "-of"   || arg == "--output-file")     { params.fname_out.emplace_back(argv[++i]); }
@@ -542,8 +542,8 @@ bool output_sqlite(struct whisper_context * ctx, const char * dbname, const whis
 
     std::string sql_insert = "INSERT INTO Segments (Start, End, Speaker, Text, SummaryId, SpeakerTargetId) VALUES (" +
                             std::to_string(10 * t0) + "," +
-                            std::to_string(10 * t1) + ",'" +
-                            speaker + "','" +
+                            std::to_string(10 * t1) + "," +
+                            "NULL," + // Speaker empty til overwritten by SpeakerTargeter
                             text_escaped + "'," +
                             "NULL," + // empty til overwritten by Summarizer
                             "NULL" + // empty til overwritten by SpeakerTargeter
